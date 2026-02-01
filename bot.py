@@ -5,7 +5,7 @@ import logging
 import random
 from datetime import datetime
 from aiogram import Bot, Dispatcher, Router, F
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message, CallbackQuery, LabeledPrice, PreCheckoutQuery
 from aiogram.filters import CommandStart, Command
 from aiogram.enums.parse_mode import ParseMode
 from aiogram.fsm.context import FSMContext
@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 class NFTStates(StatesGroup):
     waiting_for_dice = State()
 
+# FSM для создания розыгрыша админом
 class AdminStates(StatesGroup):
     waiting_for_bet_amount = State()
     waiting_for_nft_link = State()
@@ -174,29 +175,6 @@ async def show_how_to_earn(callback: CallbackQuery):
     
     await callback.message.edit_text(
         earn_text, 
-        reply_markup=share_link_kb(ref_link)
-    )
-    await callback.answer()
-
-@router.callback_query(F.data == "ref_link")
-async def show_ref_link(callback: CallbackQuery):
-    bot_info = await bot.get_me()
-    ref_link = f"https://t.me/{bot_info.username}?start={callback.from_user.id}"
-    
-    ref_text = (
-        f"🔗 <b>Ваша реферальная ссылка</b>\n\n"
-        f"<blockquote>{ref_link}</blockquote>\n\n"
-        f"<blockquote>"
-        f"📌 Что делать дальше:\n"
-        f"• Скопируйте ссылку\n"
-        f"• Отправьте другу\n"
-        f"• Мгновенно получите 1 ⭐"
-        f"</blockquote>\n\n"
-        f"<b>💎 Ваша ссылка готова к работе!</b>"
-    )
-    
-    await callback.message.edit_text(
-        ref_text, 
         reply_markup=share_link_kb(ref_link)
     )
     await callback.answer()
@@ -348,7 +326,7 @@ async def show_my_withdrawals(callback: CallbackQuery):
     await callback.message.edit_text(withdrawal_text, reply_markup=my_withdrawals_kb())
     await callback.answer()
 
-# === NFT ОБРАБОТЧИКИ ===
+# === NFT ОБРАБОТЧИКИ (ОПЛАТА ВКЛЮЧЕНА) ===
 @router.callback_query(F.data == "nft_giveaway")
 async def show_nft_giveaway(callback: CallbackQuery):
     """Показать активный розыгрыш NFT"""
@@ -376,7 +354,7 @@ async def show_nft_giveaway(callback: CallbackQuery):
         f"🎯 <b>Условия:</b> Выпадет <b>64</b> = выигрыш!"
         f"</blockquote>\n\n"
         f"<blockquote>🍀 <b>Испытайте свою удачу!</b>\n"
-        f"Нажмите кнопку и отправьте анимированный эмодзи 🎰\n"
+        f"Нажмите кнопку ниже, оплатите {bet_amount} Stars и сыграйте.\n"
         f"Если выпадет <b>64</b> (максимум) — NFT ваш!\n\n"
         f"<i>Попыток неограничено!</i></blockquote>"
     )
@@ -389,8 +367,10 @@ async def show_nft_giveaway(callback: CallbackQuery):
     await callback.answer()
 
 @router.callback_query(F.data.startswith("join_nft_"))
-async def process_nft_attempt(callback: CallbackQuery, state: FSMContext):
-    """Начало попытки - создаем запись в БД и просим отправить dice"""
+async def process_nft_payment(callback: CallbackQuery, state: FSMContext):
+    """
+    ОПЛАТА ВКЛЮЧЕНА: Отправка инвойса на оплату Stars
+    """
     user_id = callback.from_user.id
     giveaway_id = int(callback.data.split("_")[2])
     
@@ -399,52 +379,83 @@ async def process_nft_attempt(callback: CallbackQuery, state: FSMContext):
         await callback.answer("❌ Этот розыгрыш уже завершен!", show_alert=True)
         return
     
-    # Добавляем новую попытку в БД (неограниченное количество)
-    attempt_id = await add_attempt(giveaway_id, user_id)
-    if not attempt_id:
-        await callback.answer("❌ Ошибка создания попытки!", show_alert=True)
-        return
+    bet_amount = giveaway[1]
     
-    # Получаем номер попытки для отображения
-    attempts_count = await get_user_attempts_count(giveaway_id, user_id)
+    # Создаем инвойс на оплату Stars
+    try:
+        await bot.send_invoice(
+            chat_id=user_id,
+            title="🎰 Участие в розыгрыше NFT",
+            description=f"Оплата участия в розыгрыше NFT. Шанс выиграть уникальный NFT приз!\n\nСумма ставки: {bet_amount} Stars",
+            payload=f"nft_{giveaway_id}_{user_id}",
+            provider_token="",  # Пусто для Telegram Stars
+            currency="XTR",     # XTR = Telegram Stars
+            prices=[LabeledPrice(label=f"Ставка в розыгрыше", amount=bet_amount)]
+        )
+        await callback.answer("💸 Счет на оплату отправлен!")
+    except Exception as e:
+        logger.error(f"Ошибка создания инвойса: {e}")
+        await callback.answer("❌ Ошибка создания счета!", show_alert=True)
+
+@router.pre_checkout_query()
+async def pre_checkout_handler(pre_checkout_query: PreCheckoutQuery):
+    """Обработка предварительной проверки оплаты"""
+    await pre_checkout_query.answer(ok=True)
+
+@router.message(F.successful_payment)
+async def successful_payment_handler(message: Message, state: FSMContext):
+    """Обработка успешной оплаты - переход к игре"""
+    payload = message.successful_payment.invoice_payload
     
-    # Сохраняем данные в FSM
-    await state.set_state(NFTStates.waiting_for_dice)
-    await state.update_data(
-        giveaway_id=giveaway_id,
-        attempt_id=attempt_id,
-        bet_amount=giveaway[1],
-        nft_link=giveaway[2]
-    )
-    
-    # Удаляем старое сообщение и просим отправить dice
-    await callback.message.delete()
-    await callback.message.answer(
-        f"🎰 <b>ПОПЫТКА #{attempts_count}</b> (ТЕСТ)\n\n"
-        f"<blockquote>"
-        f"💎 Приз: <a href='{giveaway[2]}'>NFT Подарок</a>\n"
-        f"🎯 Цель: Выпадение <b>64</b> (максимальное значение)\n"
-        f"💰 Ставка: {giveaway[1]} Stars (оплата отключена для теста)"
-        f"</blockquote>\n\n"
-        f"<b>👉 Отправьте анимированный эмодзи</b> 🎰 <b>(Слот-машина)</b>\n\n"
-        f"<i>Нажмите на иконку 🎰 в панели эмодзи Telegram (раздел игры/развлечение)</i>",
-        disable_web_page_preview=True,
-        reply_markup=back_to_menu_kb()
-    )
-    await callback.answer()
+    if payload.startswith("nft_"):
+        _, giveaway_id, user_id = payload.split("_")
+        giveaway_id = int(giveaway_id)
+        user_id = int(user_id)
+        
+        giveaway = await get_active_giveaway()
+        if not giveaway or giveaway[0] != giveaway_id:
+            await message.answer("❌ Этот розыгрыш уже завершен!")
+            return
+        
+        # Добавляем попытку в БД
+        attempt_id = await add_attempt(giveaway_id, user_id)
+        if not attempt_id:
+            await message.answer("❌ Ошибка создания попытки!")
+            return
+        
+        attempts_count = await get_user_attempts_count(giveaway_id, user_id)
+        
+        # Сохраняем данные в FSM
+        await state.set_state(NFTStates.waiting_for_dice)
+        await state.update_data(
+            giveaway_id=giveaway_id,
+            attempt_id=attempt_id,
+            bet_amount=giveaway[1],
+            nft_link=giveaway[2]
+        )
+        
+        await message.answer(
+            f"✅ <b>Оплата прошла успешно!</b>\n\n"
+            f"<blockquote>"
+            f"🎰 Попытка #{attempts_count}\n"
+            f"💎 Приз: <a href='{giveaway[2]}'>NFT Подарок</a>\n"
+            f"🎯 Цель: Выпадение 64 (максимальное значение)"
+            f"</blockquote>\n\n"
+            f"<b>👉 Отправьте анимированный эмодзи</b> 🎰 <b>(Слот-машина)</b>\n\n"
+            f"<i>Нажмите на иконку 🎰 в панели эмодзи Telegram (раздел игры/развлечения)</i>",
+            disable_web_page_preview=True,
+            reply_markup=back_to_menu_kb()
+        )
 
 @router.message(NFTStates.waiting_for_dice, F.dice.emoji == "🎰")
 async def process_slot_dice(message: Message, state: FSMContext):
     """Обработка броска слот-машины (🎰) - защита от спама"""
     user_id = message.from_user.id
     
-    # Проверяем, не обрабатывается ли уже бросок этого пользователя
     if user_id in processing_dice:
-        # Игнорируем повторные броски во время обработки
         return
     
     try:
-        # Добавляем в обработку (блокируем повторные)
         processing_dice.add(user_id)
         
         data = await state.get_data()
@@ -456,36 +467,27 @@ async def process_slot_dice(message: Message, state: FSMContext):
             await message.answer("❌ Ошибка: данные игры не найдены.")
             return
         
-        # Проверяем, активен ли еще розыгрыш
         giveaway = await get_active_giveaway()
         if not giveaway or giveaway[0] != giveaway_id:
             await message.answer("❌ Этот розыгрыш уже завершен!", reply_markup=main_menu_kb())
             return
         
-        # Получаем значение dice (1-64)
         dice_value = message.dice.value
         is_win = (dice_value == 64)
         
-        # Сохраняем результат в БД
         result_status = "win" if is_win else "lose"
         await update_attempt_result(attempt_id, result_status, str(dice_value))
         
-        # Сразу очищаем состояние, чтобы последующие dice не попадали в этот обработчик
         await state.clear()
-        
-        # Ждем окончания анимации dice
         await asyncio.sleep(2)
         
         if is_win:
-            # Закрываем розыгрыш с победителем
             await close_giveaway(giveaway_id, user_id)
             
-            # Получаем данные пользователя
             user = await get_user(user_id)
             user_name = user[2] if user else f"ID:{user_id}"
             user_link = f"tg://user?id={user_id}"
             
-            # Уведомляем админа
             admin_msg = (
                 f"🏆 <b>ПОБЕДИТЕЛЬ В РОЗЫГРЫШЕ NFT!</b>\n\n"
                 f"<blockquote>"
@@ -503,7 +505,6 @@ async def process_slot_dice(message: Message, state: FSMContext):
             except Exception as e:
                 logger.error(f"Ошибка уведомления админа: {e}")
             
-            # Рассылка всем пользователям
             all_users = await get_all_users()
             announce_text = (
                 f"🎉 <b>ПОБЕДИТЕЛЬ ОПРЕДЕЛЕН!</b>\n\n"
@@ -524,11 +525,9 @@ async def process_slot_dice(message: Message, state: FSMContext):
                 reply_markup=main_menu_kb()
             )
             
-            # Асинхронная рассылка
             asyncio.create_task(broadcast_message(all_users, announce_text, exclude_user=user_id))
             
         else:
-            # Проигрыш
             await message.answer(
                 f"😔 <b>Не повезло...</b>\n\n"
                 f"<blockquote>🎰 Выпало: <b>{dice_value}</b> из 64\n\n"
@@ -538,13 +537,11 @@ async def process_slot_dice(message: Message, state: FSMContext):
             )
             
     finally:
-        # В любом случае удаляем из обработки (через 1 секунду, чтобы точно всё завершилось)
         await asyncio.sleep(1)
         processing_dice.discard(user_id)
 
 @router.message(NFTStates.waiting_for_dice, F.dice)
 async def wrong_dice_type(message: Message):
-    """Если пользователь отправил другой dice (не 🎰)"""
     await message.answer(
         "❌ <b>Нужен именно эмодзи Слот-машины</b> 🎰!\n\n"
         f"Вы отправили: {message.dice.emoji}\n"
@@ -553,91 +550,251 @@ async def wrong_dice_type(message: Message):
 
 @router.message(NFTStates.waiting_for_dice)
 async def not_dice(message: Message):
-    """Если пользователь отправил не dice, а текст"""
     await message.answer(
         "❌ <b>Отправьте анимированный эмодзи</b> 🎰 <b>(Слот-машина)</b>!\n\n"
         "Он находится в панели эмодзи Telegram → раздел 'Игры' (или '🎲') → 🎰"
     )
 
-# === АДМИНСКИЕ КОМАНДЫ ===
-@router.message(Command("create_nft"))
-async def admin_create_giveaway(message: Message):
-    """Создание розыгрыша NFT (только для админа) с рассылкой всем пользователям"""
+# === АДМИН МЕНЮ ===
+@router.message(Command("admin"))
+async def admin_panel(message: Message):
     if message.from_user.id != ADMIN_ID:
         await message.answer("❌ Доступ запрещен!")
         return
     
-    args = message.text.split()
-    if len(args) < 3:
-        await message.answer(
-            "❌ <b>Неверный формат!</b>\n\n"
-            "<b>Использование:</b>\n"
-            "<code>/create_nft [сумма_ставки] [ссылка_на_NFT]</code>\n\n"
-            "<b>Пример:</b>\n"
-            "<code>/create_nft 50 https://t.me/nft/mygift</code>"
-        )
+    admin_text = (
+        f"👑 <b>ПАНЕЛЬ АДМИНИСТРАТОРА</b>\n\n"
+        f"Добро пожаловать, <b>{message.from_user.full_name}</b>!\n\n"
+        f"<blockquote>Выберите раздел:</blockquote>"
+    )
+    
+    await message.answer(admin_text, reply_markup=admin_menu_kb())
+
+@router.callback_query(F.data == "admin_stats")
+async def admin_full_stats(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Доступ запрещен!", show_alert=True)
         return
     
     try:
-        bet_amount = int(args[1])
-        nft_link = args[2]
-        
-        if bet_amount < 1:
-            await message.answer("❌ Сумма ставки должна быть больше 0!")
-            return
-        
-        giveaway_id = await create_giveaway(bet_amount, nft_link, message.from_user.id)
-        
-        if giveaway_id:
-            # Сообщение админу
-            await message.answer(
-                f"✅ <b>Розыгрыш NFT #{giveaway_id} создан!</b>\n\n"
-                f"<blockquote>"
-                f"💰 Ставка: {bet_amount} Stars\n"
-                f"💎 NFT: <a href='{nft_link}'>Ссылка на приз</a>\n"
-                f"🎰 Условие: Выпадение 64 (максимум) в слотах\n"
-                f"🔄 Попыток на пользователя: Неограничено"
-                f"</blockquote>\n\n"
-                f"Начинаю рассылку уведомлений всем пользователям...",
-                disable_web_page_preview=True
+        async with aiosqlite.connect("bot_database.db") as db:
+            cursor = await db.execute("SELECT COUNT(*) FROM users")
+            total_users = (await cursor.fetchone())[0]
+            
+            cursor = await db.execute(
+                "SELECT COUNT(*) FROM users WHERE date(joined_date) = date('now')"
             )
+            new_today = (await cursor.fetchone())[0]
             
-            # === РАССЫЛКА ВСЕМ ПОЛЬЗОВАТЕЛЯМ О НОВОМ РОЗЫГРЫШЕ ===
-            all_users = await get_all_users()
-            announce_text = (
-                f"🎰 <b>НОВЫЙ РОЗЫГРЫШ NFT!</b>\n\n"
-                f"<blockquote>"
-                f"💎 Новый приз разыгрывается прямо сейчас!\n"
-                f"💰 Ставка: {bet_amount} Stars\n"
-                f"🎯 Условие: Выпадение 64 (максимум) в слотах\n"
-                f"🔗 <a href='{nft_link}'>Посмотреть NFT приз</a>"
-                f"</blockquote>\n\n"
-                f"<b>🍀 Испытайте свою удачу прямо сейчас!</b>\n"
-                f"Нажмите '🎰 Получить NFT' в меню!"
+            cursor = await db.execute(
+                "SELECT COALESCE(SUM(amount), 0) FROM withdrawal_requests WHERE status = 'paid'"
             )
+            total_paid = (await cursor.fetchone())[0]
             
-            # Асинхронная рассылка (чтобы не блокировать бота)
-            asyncio.create_task(broadcast_message(all_users, announce_text))
+            cursor = await db.execute(
+                "SELECT COALESCE(SUM(amount), 0) FROM withdrawal_requests WHERE status = 'pending'"
+            )
+            pending_amount = (await cursor.fetchone())[0]
             
-            # Логирование
-            logger.info(f"Админ создал розыгрыш #{giveaway_id}. Рассылка начата на {len(all_users)} пользователей.")
+            cursor = await db.execute("SELECT COUNT(*) FROM withdrawal_requests")
+            total_withdrawals = (await cursor.fetchone())[0]
             
-        else:
-            await message.answer("❌ Ошибка создания розыгрыша!")
+            cursor = await db.execute("SELECT COUNT(*) FROM withdrawal_requests WHERE status = 'pending'")
+            pending_count = (await cursor.fetchone())[0]
             
-    except ValueError:
-        await message.answer("❌ Сумма ставки должна быть числом!")
+            cursor = await db.execute("SELECT COUNT(*) FROM withdrawal_requests WHERE status = 'paid'")
+            paid_count = (await cursor.fetchone())[0]
+            
+            cursor = await db.execute("SELECT COUNT(*) FROM nft_giveaways WHERE is_active = 1")
+            active_giveaways = (await cursor.fetchone())[0]
+            
+            cursor = await db.execute(
+                "SELECT COUNT(*) FROM nft_giveaways WHERE winner_id IS NOT NULL"
+            )
+            completed_giveaways = (await cursor.fetchone())[0]
+            
+            cursor = await db.execute("SELECT COUNT(*) FROM nft_giveaways")
+            total_giveaways = (await cursor.fetchone())[0]
+            
+            cursor = await db.execute(
+                "SELECT COUNT(*) FROM nft_attempts WHERE giveaway_id IN "
+                "(SELECT id FROM nft_giveaways WHERE is_active = 1)"
+            )
+            current_attempts = (await cursor.fetchone())[0]
+            
+            cursor = await db.execute(
+                "SELECT username, referrals_count, stars_earned FROM users ORDER BY referrals_count DESC LIMIT 5"
+            )
+            top_refs = await cursor.fetchall()
+    
+    except Exception as e:
+        logger.error(f"Ошибка получения статистики: {e}")
+        await callback.answer("❌ Ошибка загрузки статистики!", show_alert=True)
+        return
+    
+    stats_text = (
+        f"📊 <b>ПОДРОБНАЯ СТАТИСТИКА БОТА</b>\n\n"
+        f"<b>👥 Пользователи:</b>\n"
+        f"<blockquote>"
+        f"├ Всего: <b>{total_users}</b>\n"
+        f"├ Новых сегодня: <b>{new_today}</b>\n"
+        f"└ Рефералов всего: <b>{sum([r[1] for r in top_refs])}</b>"
+        f"</blockquote>\n\n"
+        f"<b>💸 Выводы Stars:</b>\n"
+        f"<blockquote>"
+        f"├ Всего заявок: <b>{total_withdrawals}</b>\n"
+        f"├ В обработке: <b>{pending_count}</b>\n"
+        f"├ Выплачено: <b>{paid_count}</b>\n"
+        f"├ Всего выплачено: <b>{total_paid}</b> ⭐\n"
+        f"└ В ожидании: <b>{pending_amount}</b> ⭐"
+        f"</blockquote>\n\n"
+        f"<b>🎰 NFT Розыгрыши:</b>\n"
+        f"<blockquote>"
+        f"├ Активных: <b>{active_giveaways}</b>\n"
+        f"├ Проведено: <b>{completed_giveaways}</b>\n"
+        f"├ Всего создано: <b>{total_giveaways}</b>\n"
+        f"└ Попыток в текущем: <b>{current_attempts}</b>"
+        f"</blockquote>\n\n"
+        f"<b>🏆 Топ-5 рефереров:</b>\n<blockquote>"
+    )
+    
+    for idx, (username, refs, stars) in enumerate(top_refs, 1):
+        name = f"@{username}" if username else f"ID:{idx}"
+        stats_text += f"{idx}. {name} — {refs} ref / {stars} ⭐\n"
+    
+    stats_text += "</blockquote>"
+    
+    await callback.message.edit_text(stats_text, reply_markup=admin_back_kb())
+    await callback.answer()
 
-@router.message(Command("stop_nft"))
-async def admin_stop_giveaway(message: Message):
-    """Досрочное завершение розыгрыша (только для админа)"""
+@router.callback_query(F.data == "admin_giveaway")
+async def admin_giveaway_menu(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Доступ запрещен!", show_alert=True)
+        return
+    
+    giveaway = await get_active_giveaway()
+    
+    if giveaway:
+        stats = await get_giveaway_stats(giveaway[0])
+        text = (
+            f"🎰 <b>УПРАВЛЕНИЕ РОЗЫГРЫШАМИ</b>\n\n"
+            f"<b>🔥 Активен розыгрыш #{giveaway[0]}</b>\n\n"
+            f"<blockquote>"
+            f"💰 Ставка: {giveaway[1]} Stars\n"
+            f"💎 NFT: <a href='{giveaway[2]}'>Ссылка на приз</a>\n"
+            f"👥 Уникальных игроков: {stats['unique_users']}\n"
+            f"🎲 Всего попыток: {stats['total_attempts']}\n"
+            f"📅 Создан: {giveaway[6][:10] if giveaway[6] else 'Неизвестно'}"
+            f"</blockquote>\n\n"
+            f"Выберите действие:"
+        )
+        kb = admin_giveaway_manage_kb(has_active=True)
+    else:
+        text = (
+            f"🎰 <b>УПРАВЛЕНИЕ РОЗЫГРЫШАМИ</b>\n\n"
+            f"<blockquote>Сейчас нет активных розыгрышей.</blockquote>"
+        )
+        kb = admin_giveaway_manage_kb(has_active=False)
+    
+    await callback.message.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
+    await callback.answer()
+
+@router.callback_query(F.data == "admin_create_giveaway")
+async def admin_start_create_giveaway(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Доступ запрещен!", show_alert=True)
+        return
+    
+    await state.set_state(AdminStates.waiting_for_bet_amount)
+    
+    await callback.message.edit_text(
+        "🎰 <b>СОЗДАНИЕ НОВОГО РОЗЫГРЫША</b>\n\n"
+        "<b>Шаг 1/2:</b> Введите сумму ставки (число Stars)\n\n"
+        "<i>Пример: 50</i>",
+        reply_markup=admin_cancel_kb()
+    )
+    await callback.answer()
+
+@router.message(AdminStates.waiting_for_bet_amount, F.text.regexp(r'^\d+$'))
+async def admin_process_bet_amount(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
-        await message.answer("❌ Доступ запрещен!")
+        return
+    
+    bet_amount = int(message.text)
+    if bet_amount < 1:
+        await message.answer("❌ Сумма должна быть больше 0!", reply_markup=admin_cancel_kb())
+        return
+    
+    await state.update_data(bet_amount=bet_amount)
+    await state.set_state(AdminStates.waiting_for_nft_link)
+    
+    await message.answer(
+        "🎰 <b>СОЗДАНИЕ НОВОГО РОЗЫГРЫША</b>\n\n"
+        f"<b>Шаг 1:</b> ✅ Ставка: {bet_amount} Stars\n"
+        f"<b>Шаг 2/2:</b> Отправьте ссылку на NFT приз\n\n"
+        f"<i>Пример: https://t.me/nft/mygift</i>",
+        reply_markup=admin_cancel_kb()
+    )
+
+@router.message(AdminStates.waiting_for_bet_amount)
+async def admin_wrong_bet_amount(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await message.answer("❌ Введите число! Например: 50", reply_markup=admin_cancel_kb())
+
+@router.message(AdminStates.waiting_for_nft_link, F.text)
+async def admin_process_nft_link(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    data = await state.get_data()
+    bet_amount = data.get("bet_amount")
+    nft_link = message.text
+    
+    giveaway_id = await create_giveaway(bet_amount, nft_link, message.from_user.id)
+    
+    if giveaway_id:
+        await message.answer(
+            f"✅ <b>Розыгрыш #{giveaway_id} создан!</b>\n\n"
+            f"<blockquote>"
+            f"💰 Ставка: {bet_amount} Stars\n"
+            f"💎 NFT: {nft_link}\n"
+            f"🎰 Условие: Выпадение 64"
+            f"</blockquote>\n\n"
+            f"Начинаю рассылку уведомлений...",
+            reply_markup=admin_menu_kb(),
+            disable_web_page_preview=True
+        )
+        
+        all_users = await get_all_users()
+        announce_text = (
+            f"🎰 <b>НОВЫЙ РОЗЫГРЫШ NFT!</b>\n\n"
+            f"<blockquote>"
+            f"💎 Новый приз разыгрывается!\n"
+            f"💰 Ставка: {bet_amount} Stars\n"
+            f"🎯 Условие: Выпадение 64 (максимум)\n"
+            f"🔗 <a href='{nft_link}'>Посмотреть приз</a>"
+            f"</blockquote>\n\n"
+            f"<b>🍀 Испытайте удачу!</b> Нажмите '🎰 Получить NFT' в меню!"
+        )
+        
+        asyncio.create_task(broadcast_message(all_users, announce_text))
+        logger.info(f"Админ создал розыгрыш #{giveaway_id}")
+    else:
+        await message.answer("❌ Ошибка создания розыгрыша!", reply_markup=admin_menu_kb())
+    
+    await state.clear()
+
+@router.callback_query(F.data == "admin_stop_giveaway")
+async def admin_stop_current_giveaway(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Доступ запрещен!", show_alert=True)
         return
     
     giveaway = await get_active_giveaway()
     if not giveaway:
-        await message.answer("❌ Нет активных розыгрышей для завершения!")
+        await callback.answer("❌ Нет активных розыгрышей!", show_alert=True)
         return
     
     async with aiosqlite.connect("bot_database.db") as db:
@@ -647,8 +804,76 @@ async def admin_stop_giveaway(message: Message):
         )
         await db.commit()
     
-    await message.answer(f"✅ Розыгрыш #{giveaway[0]} завершен досрочно!")
+    await callback.message.edit_text(
+        f"✅ <b>Розыгрыш #{giveaway[0]} завершен!</b>\n\n"
+        f"<blockquote>Статистика сохранена в истории.</blockquote>",
+        reply_markup=admin_giveaway_menu()
+    )
+    await callback.answer("Розыгрыш завершен!")
 
+@router.callback_query(F.data == "admin_giveaway_history")
+async def admin_giveaway_history(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Доступ запрещен!", show_alert=True)
+        return
+    
+    try:
+        async with aiosqlite.connect("bot_database.db") as db:
+            cursor = await db.execute(
+                "SELECT * FROM nft_giveaways WHERE is_active = 0 ORDER BY ended_at DESC LIMIT 5"
+            )
+            history = await cursor.fetchall()
+    except Exception as e:
+        logger.error(f"Ошибка: {e}")
+        await callback.answer("❌ Ошибка загрузки!", show_alert=True)
+        return
+    
+    if not history:
+        text = "📜 <b>История розыгрышей</b>\n\n<blockquote>Пока нет завершенных розыгрышей.</blockquote>"
+    else:
+        text = "📜 <b>ПОСЛЕДНИЕ ЗАВЕРШЕННЫЕ РОЗЫГРЫШИ</b>\n\n"
+        
+        for row in history:
+            giveaway_id, bet_amount, nft_link, is_active, created_by, winner_id, created_at, ended_at = row
+            winner = await get_user(winner_id) if winner_id else None
+            winner_name = winner[2] if winner else "Никто (завершен админом)"
+            
+            text += (
+                f"<blockquote><b>#{giveaway_id}</b>\n"
+                f"💰 Ставка: {bet_amount} Stars\n"
+                f"🏆 Победитель: {winner_name}\n"
+                f"📅 {ended_at[:10] if ended_at else 'Неизвестно'}</blockquote>\n\n"
+            )
+    
+    await callback.message.edit_text(text, reply_markup=admin_back_kb())
+    await callback.answer()
+
+@router.callback_query(F.data == "admin_menu")
+async def admin_back_to_menu(callback: CallbackQuery, state: FSMContext = None):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Доступ запрещен!", show_alert=True)
+        return
+    
+    if state:
+        await state.clear()
+    
+    await callback.message.edit_text(
+        "👑 <b>ПАНЕЛЬ АДМИНИСТРАТОРА</b>\n\n"
+        "Выберите раздел:",
+        reply_markup=admin_menu_kb()
+    )
+    await callback.answer()
+
+@router.callback_query(F.data == "cancel_action")
+async def admin_cancel_action(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Доступ запрещен!", show_alert=True)
+        return
+    
+    await state.clear()
+    await admin_back_to_menu(callback, state)
+
+# === ОБРАБОТЧИКИ ВЫВОДА (из предыдущих версий) ===
 @router.callback_query(F.data.startswith("admin_paid_"))
 async def mark_as_paid(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
@@ -747,7 +972,6 @@ async def mark_as_rejected(callback: CallbackQuery):
 
 @router.callback_query(F.data == "back_to_menu")
 async def back_to_menu(callback: CallbackQuery, state: FSMContext = None):
-    # Очищаем состояние если есть
     if state:
         await state.clear()
     
@@ -776,363 +1000,6 @@ async def back_to_menu(callback: CallbackQuery, state: FSMContext = None):
     
     await callback.answer()
 
-# === НОВОЕ: АДМИН МЕНЮ ===
-@router.message(Command("admin"))
-async def admin_panel(message: Message):
-    """Главное меню администратора"""
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("❌ Доступ запрещен!")
-        return
-    
-    admin_text = (
-        f"👑 <b>ПАНЕЛЬ АДМИНИСТРАТОРА</b>\n\n"
-        f"Добро пожаловать, <b>{message.from_user.full_name}</b>!\n\n"
-        f"<blockquote>Выберите раздел:</blockquote>"
-    )
-    
-    await message.answer(admin_text, reply_markup=admin_menu_kb())
-
-@router.callback_query(F.data == "admin_stats")
-async def admin_full_stats(callback: CallbackQuery):
-    """Подробная статистика бота"""
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("❌ Доступ запрещен!", show_alert=True)
-        return
-    
-    try:
-        async with aiosqlite.connect("bot_database.db") as db:
-            # Всего пользователей
-            cursor = await db.execute("SELECT COUNT(*) FROM users")
-            total_users = (await cursor.fetchone())[0]
-            
-            # Новые за сегодня
-            cursor = await db.execute(
-                "SELECT COUNT(*) FROM users WHERE date(joined_date) = date('now')"
-            )
-            new_today = (await cursor.fetchone())[0]
-            
-            # Общая сумма выведенных звезд
-            cursor = await db.execute(
-                "SELECT COALESCE(SUM(amount), 0) FROM withdrawal_requests WHERE status = 'paid'"
-            )
-            total_paid = (await cursor.fetchone())[0]
-            
-            # Сумма на выводе (pending)
-            cursor = await db.execute(
-                "SELECT COALESCE(SUM(amount), 0) FROM withdrawal_requests WHERE status = 'pending'"
-            )
-            pending_amount = (await cursor.fetchone())[0]
-            
-            # Количество заявок на вывод
-            cursor = await db.execute("SELECT COUNT(*) FROM withdrawal_requests")
-            total_withdrawals = (await cursor.fetchone())[0]
-            
-            cursor = await db.execute("SELECT COUNT(*) FROM withdrawal_requests WHERE status = 'pending'")
-            pending_count = (await cursor.fetchone())[0]
-            
-            cursor = await db.execute("SELECT COUNT(*) FROM withdrawal_requests WHERE status = 'paid'")
-            paid_count = (await cursor.fetchone())[0]
-            
-            # Активный розыгрыш NFT
-            cursor = await db.execute("SELECT COUNT(*) FROM nft_giveaways WHERE is_active = 1")
-            active_giveaways = (await cursor.fetchone())[0]
-            
-            cursor = await db.execute(
-                "SELECT COUNT(*) FROM nft_giveaways WHERE winner_id IS NOT NULL"
-            )
-            completed_giveaways = (await cursor.fetchone())[0]
-            
-            cursor = await db.execute("SELECT COUNT(*) FROM nft_giveaways")
-            total_giveaways = (await cursor.fetchone())[0]
-            
-            # Попытки в текущем розыгрыше
-            cursor = await db.execute(
-                "SELECT COUNT(*) FROM nft_attempts WHERE giveaway_id IN "
-                "(SELECT id FROM nft_giveaways WHERE is_active = 1)"
-            )
-            current_attempts = (await cursor.fetchone())[0]
-            
-            # Топ рефереров (для админки)
-            cursor = await db.execute(
-                "SELECT username, referrals_count, stars_earned FROM users ORDER BY referrals_count DESC LIMIT 5"
-            )
-            top_refs = await cursor.fetchall()
-    
-    except Exception as e:
-        logger.error(f"Ошибка получения статистики: {e}")
-        await callback.answer("❌ Ошибка загрузки статистики!", show_alert=True)
-        return
-    
-    # Формируем текст статистики
-    stats_text = (
-        f"📊 <b>ПОДРОБНАЯ СТАТИСТИКА БОТА</b>\n\n"
-        f"<b>👥 Пользователи:</b>\n"
-        f"<blockquote>"
-        f"├ Всего: <b>{total_users}</b>\n"
-        f"├ Новых сегодня: <b>{new_today}</b>\n"
-        f"└ Рефералов всего: <b>{sum([r[1] for r in top_refs])}</b>"
-        f"</blockquote>\n\n"
-        f"<b>💸 Выводы Stars:</b>\n"
-        f"<blockquote>"
-        f"├ Всего заявок: <b>{total_withdrawals}</b>\n"
-        f"├ В обработке: <b>{pending_count}</b>\n"
-        f"├ Выплачено: <b>{paid_count}</b>\n"
-        f"├ Всего выплачено: <b>{total_paid}</b> ⭐\n"
-        f"└ В ожидании: <b>{pending_amount}</b> ⭐"
-        f"</blockquote>\n\n"
-        f"<b>🎰 NFT Розыгрыши:</b>\n"
-        f"<blockquote>"
-        f"├ Активных: <b>{active_giveaways}</b>\n"
-        f"├ Проведено: <b>{completed_giveaways}</b>\n"
-        f"├ Всего создано: <b>{total_giveaways}</b>\n"
-        f"└ Попыток в текущем: <b>{current_attempts}</b>"
-        f"</blockquote>\n\n"
-        f"<b>🏆 Топ-5 рефереров:</b>\n<blockquote>"
-    )
-    
-    for idx, (username, refs, stars) in enumerate(top_refs, 1):
-        name = f"@{username}" if username else f"ID:{idx}"
-        stats_text += f"{idx}. {name} — {refs} ref / {stars} ⭐\n"
-    
-    stats_text += "</blockquote>"
-    
-    await callback.message.edit_text(stats_text, reply_markup=admin_back_kb())
-    await callback.answer()
-
-@router.callback_query(F.data == "admin_giveaway")
-async def admin_giveaway_menu(callback: CallbackQuery):
-    """Управление розыгрышами"""
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("❌ Доступ запрещен!", show_alert=True)
-        return
-    
-    giveaway = await get_active_giveaway()
-    
-    if giveaway:
-        stats = await get_giveaway_stats(giveaway[0])
-        text = (
-            f"🎰 <b>УПРАВЛЕНИЕ РОЗЫГРЫШАМИ</b>\n\n"
-            f"<b>🔥 Активен розыгрыш #{giveaway[0]}</b>\n\n"
-            f"<blockquote>"
-            f"💰 Ставка: {giveaway[1]} Stars\n"
-            f"💎 NFT: <a href='{giveaway[2]}'>Ссылка на приз</a>\n"
-            f"👥 Уникальных игроков: {stats['unique_users']}\n"
-            f"🎲 Всего попыток: {stats['total_attempts']}\n"
-            f"📅 Создан: {giveaway[6][:10] if giveaway[6] else 'Неизвестно'}"
-            f"</blockquote>\n\n"
-            f"Выберите действие:"
-        )
-        kb = admin_giveaway_manage_kb(has_active=True)
-    else:
-        text = (
-            f"🎰 <b>УПРАВЛЕНИЕ РОЗЫГРЫШАМИ</b>\n\n"
-            f"<blockquote>Сейчас нет активных розыгрышей.</blockquote>"
-        )
-        kb = admin_giveaway_manage_kb(has_active=False)
-    
-    await callback.message.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
-    await callback.answer()
-
-@router.callback_query(F.data == "admin_create_giveaway")
-async def admin_start_create_giveaway(callback: CallbackQuery, state: FSMContext):
-    """Начало создания розыгрыша через меню"""
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("❌ Доступ запрещен!", show_alert=True)
-        return
-    
-    await state.set_state(AdminStates.waiting_for_bet_amount)
-    
-    await callback.message.edit_text(
-        "🎰 <b>СОЗДАНИЕ НОВОГО РОЗЫГРЫША</b>\n\n"
-        "<b>Шаг 1/2:</b> Введите сумму ставки (число Stars)\n\n"
-        "<i>Пример: 50</i>",
-        reply_markup=admin_cancel_kb()
-    )
-    await callback.answer()
-
-@router.message(AdminStates.waiting_for_bet_amount, F.text.regexp(r'^\d+$'))
-async def admin_process_bet_amount(message: Message, state: FSMContext):
-    """Обработка суммы ставки"""
-    if message.from_user.id != ADMIN_ID:
-        return
-    
-    bet_amount = int(message.text)
-    if bet_amount < 1:
-        await message.answer("❌ Сумма должна быть больше 0!", reply_markup=admin_cancel_kb())
-        return
-    
-    await state.update_data(bet_amount=bet_amount)
-    await state.set_state(AdminStates.waiting_for_nft_link)
-    
-    await message.answer(
-        "🎰 <b>СОЗДАНИЕ НОВОГО РОЗЫГРЫША</b>\n\n"
-        f"<b>Шаг 1:</b> ✅ Ставка: {bet_amount} Stars\n"
-        f"<b>Шаг 2/2:</b> Отправьте ссылку на NFT приз\n\n"
-        f"<i>Пример: https://t.me/nft/mygift или любая ссылка</i>",
-        reply_markup=admin_cancel_kb()
-    )
-
-@router.message(AdminStates.waiting_for_bet_amount)
-async def admin_wrong_bet_amount(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    await message.answer("❌ Введите число! Например: 50", reply_markup=admin_cancel_kb())
-
-@router.message(AdminStates.waiting_for_nft_link, F.text)
-async def admin_process_nft_link(message: Message, state: FSMContext):
-    """Обработка ссылки и создание розыгрыша"""
-    if message.from_user.id != ADMIN_ID:
-        return
-    
-    data = await state.get_data()
-    bet_amount = data.get("bet_amount")
-    nft_link = message.text
-    
-    # Создаем розыгрыш
-    giveaway_id = await create_giveaway(bet_amount, nft_link, message.from_user.id)
-    
-    if giveaway_id:
-        await message.answer(
-            f"✅ <b>Розыгрыш #{giveaway_id} создан!</b>\n\n"
-            f"<blockquote>"
-            f"💰 Ставка: {bet_amount} Stars\n"
-            f"💎 NFT: {nft_link}\n"
-            f"🎰 Условие: Выпадение 64"
-            f"</blockquote>\n\n"
-            f"Начинаю рассылку уведомлений...",
-            reply_markup=admin_menu_kb(),
-            disable_web_page_preview=True
-        )
-        
-        # Рассылка всем пользователям
-        all_users = await get_all_users()
-        announce_text = (
-            f"🎰 <b>НОВЫЙ РОЗЫГРЫШ NFT!</b>\n\n"
-            f"<blockquote>"
-            f"💎 Новый приз разыгрывается!\n"
-            f"💰 Ставка: {bet_amount} Stars\n"
-            f"🎯 Условие: Выпадение 64 (максимум)\n"
-            f"🔗 <a href='{nft_link}'>Посмотреть приз</a>"
-            f"</blockquote>\n\n"
-            f"<b>🍀 Испытайте удачу!</b> Нажмите '🎰 Получить NFT' в меню!"
-        )
-        
-        asyncio.create_task(broadcast_message(all_users, announce_text))
-        logger.info(f"Админ создал розыгрыш #{giveaway_id} через меню")
-    else:
-        await message.answer("❌ Ошибка создания розыгрыша!", reply_markup=admin_menu_kb())
-    
-    await state.clear()
-
-@router.callback_query(F.data == "admin_stop_giveaway")
-async def admin_stop_current_giveaway(callback: CallbackQuery):
-    """Остановка текущего розыгрыша"""
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("❌ Доступ запрещен!", show_alert=True)
-        return
-    
-    giveaway = await get_active_giveaway()
-    if not giveaway:
-        await callback.answer("❌ Нет активных розыгрышей!", show_alert=True)
-        return
-    
-    async with aiosqlite.connect("bot_database.db") as db:
-        await db.execute(
-            "UPDATE nft_giveaways SET is_active = 0, ended_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (giveaway[0],)
-        )
-        await db.commit()
-    
-    await callback.message.edit_text(
-        f"✅ <b>Розыгрыш #{giveaway[0]} завершен!</b>\n\n"
-        f"<blockquote>Статистика сохранена в истории.</blockquote>",
-        reply_markup=admin_giveaway_menu()
-    )
-    await callback.answer("Розыгрыш завершен!")
-
-@router.callback_query(F.data == "admin_giveaway_history")
-async def admin_giveaway_history(callback: CallbackQuery):
-    """История розыгрышей"""
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("❌ Доступ запрещен!", show_alert=True)
-        return
-    
-    try:
-        async with aiosqlite.connect("bot_database.db") as db:
-            cursor = await db.execute(
-                "SELECT * FROM nft_giveaways WHERE is_active = 0 ORDER BY ended_at DESC LIMIT 5"
-            )
-            history = await cursor.fetchall()
-    except Exception as e:
-        logger.error(f"Ошибка: {e}")
-        await callback.answer("❌ Ошибка загрузки!", show_alert=True)
-        return
-    
-    if not history:
-        text = "📜 <b>История розыгрышей</b>\n\n<blockquote>Пока нет завершенных розыгрышей.</blockquote>"
-    else:
-        text = "📜 <b>ПОСЛЕДНИЕ ЗАВЕРШЕННЫЕ РОЗЫГРЫШИ</b>\n\n"
-        
-        for row in history:
-            giveaway_id, bet_amount, nft_link, is_active, created_by, winner_id, created_at, ended_at = row
-            winner = await get_user(winner_id) if winner_id else None
-            winner_name = winner[2] if winner else "Никто (завершен админом)"
-            
-            text += (
-                f"<blockquote><b>#{giveaway_id}</b>\n"
-                f"💰 Ставка: {bet_amount} Stars\n"
-                f"🏆 Победитель: {winner_name}\n"
-                f"📅 {ended_at[:10] if ended_at else 'Неизвестно'}</blockquote>\n\n"
-            )
-    
-    await callback.message.edit_text(text, reply_markup=admin_back_kb())
-    await callback.answer()
-
-@router.callback_query(F.data == "admin_broadcast")
-async def admin_broadcast_menu(callback: CallbackQuery):
-    """Меню рассылки (дополнительно)"""
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("❌ Доступ запрещен!", show_alert=True)
-        return
-    
-    # Можно добавить FSM для создания рассылки
-    await callback.message.edit_text(
-        "📢 <b>МАССОВАЯ РАССЫЛКА</b>\n\n"
-        "<blockquote>Используйте команду:</blockquote>\n"
-        "<code>/broadcast Ваше сообщение</code>\n\n"
-        "Или вернитесь в админ-меню.",
-        reply_markup=admin_back_kb()
-    )
-    await callback.answer()
-
-@router.callback_query(F.data == "admin_menu")
-async def admin_back_to_menu(callback: CallbackQuery, state: FSMContext = None):
-    """Возврат в главное меню админа"""
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("❌ Доступ запрещен!", show_alert=True)
-        return
-    
-    if state:
-        await state.clear()
-    
-    await callback.message.edit_text(
-        "👑 <b>ПАНЕЛЬ АДМИНИСТРАТОРА</b>\n\n"
-        "Выберите раздел:",
-        reply_markup=admin_menu_kb()
-    )
-    await callback.answer()
-
-@router.callback_query(F.data == "cancel_action")
-async def admin_cancel_action(callback: CallbackQuery, state: FSMContext):
-    """Отмена действия"""
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("❌ Доступ запрещен!", show_alert=True)
-        return
-    
-    await state.clear()
-    await admin_back_to_menu(callback, state)
-
-
 # === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
 async def broadcast_message(user_ids: list, text: str, exclude_user: int = None):
     """Рассылка сообщения всем пользователям"""
@@ -1145,16 +1012,14 @@ async def broadcast_message(user_ids: list, text: str, exclude_user: int = None)
         try:
             await bot.send_message(user_id, text, reply_markup=main_menu_kb())
             success += 1
-            await asyncio.sleep(0.05)  # Задержка чтобы не превысить лимиты
+            await asyncio.sleep(0.05)
         except Exception as e:
             failed += 1
-            # Не логируем каждую ошибку, иначе спам в логах при большой рассылке
     
     if success > 0 or failed > 0:
         logger.info(f"Рассылка завершена: успешно {success}, ошибок {failed}")
 
 async def get_user_attempts_count(giveaway_id: int, user_id: int) -> int:
-    """Получить количество попыток пользователя (для отображения номера)"""
     try:
         async with aiosqlite.connect("bot_database.db") as db:
             cursor = await db.execute(
@@ -1170,7 +1035,7 @@ async def main():
     await init_db()
     logger.info("🚀 Бот запущен!")
     logger.info("📊 Реферальная система активна")
-    logger.info("🎰 NFT розыгрыши активны (ТЕСТОВЫЙ РЕЖИМ - dice 1-64)")
+    logger.info("🎰 NFT розыгрыши активны (ОПЛАТА ВКЛЮЧЕНА)")
     logger.info(f"💸 Админский канал: {ADMIN_CHANNEL_ID}")
     logger.info(f"👑 Админ ID: {ADMIN_ID}")
     logger.info(f"📏 Минимум рефералов: {MIN_REFERRALS}, минимум звезд: {MIN_STARS_WITHDRAW}")
