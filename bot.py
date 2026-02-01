@@ -207,7 +207,7 @@ async def show_withdrawal_options(callback: CallbackQuery):
         f"💸 <b>Вывод Stars</b>\n\n"
         f"<blockquote>"
         f"📊 Ваш баланс: <b>{user_data[5]} ⭐</b>\n"
-        f"👥 Рефералов: <b>{user_data[4]} человек</b>\n""
+        f"👥 Рефералов: <b>{user_data[4]} человек</b>\n"
         f"</blockquote>\n\n"
         f"<blockquote>Выберите сумму для вывода:</blockquote>"
     )
@@ -1052,5 +1052,6 @@ if __name__ == "__main__":
     except Exception as e:
         logger.critical(f"❌ Критическая ошибка: {e}")
         sys.exit(1)
+
 
 
